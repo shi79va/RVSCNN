@@ -116,7 +116,7 @@ int error_check(int* test1, int* test2, int num){
 // -----------------------------------------------------------------------------
 
 
- int* RVSCNN_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters, int stride, int padding) {
+int* RVSCNN_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters, int stride, int padding) {
     int ksize = 3; // 3x3 kernel
     int padded_size = inside + 2*padding;
     int conv_out = ((padded_size + 0 - ksize) / stride) + 1; // conv output size
@@ -156,7 +156,7 @@ int error_check(int* test1, int* test2, int num){
     int t1 = record();
 
     // Let accelerator know dimensions (use padded_size so internal memory/layouts align)
-    L_SCNN(c_in, conv_out, conv_out * conv_out, 0);
+    L_SCNN(c_in, padded_size, conv_out * conv_out, 0);
 
     for (int g = 0; g < chn_num; g++) {
         // set mode for each of the 4 hardware channels (example from your code)
@@ -197,9 +197,7 @@ int error_check(int* test1, int* test2, int num){
 
                 // Call accelerator for this 4-channel group and this tile's input patch
                 SCNN4x4(packed_filt, inptr);
-               for (int ch4 = 0; ch4 < 4; ch4++) {
                 RELU((int*)tile_accel_out, conv_out * conv_out);
-               }               
                 // After SCNN4x4, perform pooling via accelerator's POOL/POOL_WB_INT interface.
                 // Request max-pool of 2x2 (matches your original POOL(2) usage)
                 POOL(2);
@@ -233,7 +231,6 @@ int error_check(int* test1, int* test2, int num){
 
     return poutputs;
 }
-
 
 
 // -----------------------------------------------------------------------------
