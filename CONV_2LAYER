@@ -1,0 +1,364 @@
+///////////////inside more than 4  , padding =1 , c_out more than 4  => correct
+//RELU is correct bt it increases the cycle count
+///The problem of Bias is solved!! ,,, Note::the value of bias should be negetive , because the hardware subtracts it internally!!
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "../include/custom.h"
+
+// -----------------------------------------------------------------------------
+// Software reference for single conv + pool (like Base_conv_mp)
+// -----------------------------------------------------------------------------
+int* Base_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters,int stride, int padding) {
+     int ksize = 3; // 3x3 kernel
+    int conv_out = ((inside + 2 * padding - ksize) / stride) + 1;
+    int oside = ((conv_out - 2) / 2) + 1; //first 2 is for pool_size   second 2 is for pool_stride
+    //int oside = (inside - 2) / 2; // after 3x3 conv + 2x2 pool   ////original///
+    printf("oside base = %d\n",oside);
+    int *temp_buffer1 = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+                int a[4] = {0, 0, 0, 0};
+                for (int m = 0; m < c_in; m++) {    
+                    for (int my = 0; my < 2; my++) {
+                        for (int mx = 0; mx < 2; mx++) {
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 0*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 1*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 2*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 3*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 4*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 5*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 6*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 7*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 8*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 2 + mx + my*inside]);
+                        }
+                    }
+                }
+
+                int b = 0;
+                if (a[0] < a[1]) b = a[1]; else b = a[0];
+                if (b < a[2]) b = a[2];
+                if (b < a[3]) b = a[3];
+
+                temp_buffer1[x*oside*oside + j + i*oside] = b;
+            }
+        }
+    }
+
+    return temp_buffer1;
+}
+int* Base_conv(int inside, int c_in, int c_out,
+               int8_t *pInputs, int8_t *pFilters,
+               int stride, int padding)
+{
+    int ksize = 3;
+    int oside = ((inside + 2 * padding - ksize) / stride) + 1;
+
+    int *poutputss = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               // output channel
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+
+                int sum = 0;
+
+                for (int m = 0; m < c_in; m++) {
+                    for (int ky = 0; ky < 3; ky++) {
+                        for (int kx = 0; kx < 3; kx++) {
+
+                            // ----- FIXED PADDING HANDLING -----
+                            int in_y = i * stride + ky - padding;
+                            int in_x = j * stride + kx - padding;
+
+                            int8_t inval = 0;  // default padded value
+
+                            if (in_y >= 0 && in_y < inside &&
+                                in_x >= 0 && in_x < inside) {
+                                inval = pInputs[m*inside*inside +
+                                               in_y*inside + in_x];
+                            }
+
+                            // original filter indexing preserved
+                            int fidx = x + m*9*c_out + ky*3*c_out + kx*c_out;
+
+                            sum += inval * pFilters[fidx];
+                        }
+                    }
+                }
+
+                // ---- FIXED OUTPUT INDEXING (must use oside) ----
+                poutputss[x*oside*oside + i*oside + j] = sum;
+            }
+        }
+    }
+
+    return poutputss;
+}
+// -----------------------------------------------------------------------------
+// Error check function (same as example)
+// -----------------------------------------------------------------------------
+int error_check(int* test1, int* test2, int num){
+    int error = 0;
+    for(int i = 0; i < num; i++){
+        error += abs(test1[i] - test2[i]);
+    }
+    return error;
+}
+
+// -----------------------------------------------------------------------------
+// Accelerator conv + pool (RVSCNN)
+// -----------------------------------------------------------------------------
+
+
+ int* RVSCNN_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters, int stride, int padding, int *conv_bias) {
+    int ksize = 3; // 3x3 kernel
+    int padded_size = inside + 2*padding;
+    int conv_out = ((padded_size + 0 - ksize) / stride) + 1; // conv output size
+    int pool_size = 2, pool_stride = 2;
+    int oside = ((conv_out - pool_size) / pool_stride) + 1; // pooled output size
+
+    // final accelerator output (after pooling)
+    int *poutputs = (int *)calloc((size_t)oside * oside * c_out, sizeof(int));
+    if (!poutputs) { fprintf(stderr, "OOM poutputs\n"); exit(1); }
+
+    // Optional writeback buffer (not required if accelerator returns via POOL_WB_INT)
+    // keep for potential use / debugging
+    int wb_elems = conv_out * conv_out;
+    int *tile_accel_out = calloc((size_t)wb_elems * 4, sizeof(int)); // per-4-ch WB for a tile (if needed)
+    if (!tile_accel_out) { fprintf(stderr, "OOM tile_accel_out\n"); exit(1); }
+
+    // Allocate padded input and copy original into center
+    int8_t* padded_inputs = (int8_t*)calloc((size_t)c_in * padded_size * padded_size, sizeof(int8_t));
+    if (!padded_inputs) { fprintf(stderr,"OOM padded_inputs\n"); exit(1); }
+
+    for (int m = 0; m < c_in; m++) {
+        for (int y = 0; y < inside; y++) {
+            for (int x = 0; x < inside; x++) {
+                padded_inputs[m * padded_size * padded_size + (y + padding) * padded_size + (x + padding)] =
+                    pInputs[m * inside * inside + y * inside + x];
+            }
+        }
+    }
+
+    // number of 4-channel groups (ceil)
+    int chn_num = (c_out + 3) / 4;
+
+    // number of tiles along each axis (we step tiles by pool_stride=2)
+    int tile = oside; // equals 1 + (padded_size-4)/2 for our config
+
+    printf("tile: %d\n", tile);
+    int t1 = record();
+
+    // Let accelerator know dimensions (use padded_size so internal memory/layouts align)
+    L_SCNN(c_in, padded_size, conv_out * conv_out, 0);
+
+    for (int g = 0; g < chn_num; g++) {
+        // set mode for each of the 4 hardware channels (example from your code)
+        L_MODE(0,1, conv_bias[g*4+0], 1);
+        L_MODE(0,2, conv_bias[g*4+1], 1);
+        L_MODE(0,3, conv_bias[g*4+2], 1);
+        L_MODE(0,4, conv_bias[g*4+3], 1);
+        // L_MODE(0, 1, 0, 1);
+        // L_MODE(0, 2, 0, 1);
+        // L_MODE(0, 3, 0, 1);
+        // L_MODE(0, 4, 0, 1);
+
+        // pack up to 4 output-channel filters into the contiguous buffer accelerator expects
+        int packed_len = 9 * 4 * c_in;
+        int8_t *packed_filt = (int8_t*)malloc((size_t)packed_len * sizeof(int8_t));
+        if (!packed_filt) { fprintf(stderr, "OOM packed_filt\n"); exit(1); }
+
+        // Fill packed_filt. If the global out_ch >= c_out, fill zeros for that channel.
+        for (int m_in = 0; m_in < c_in; m_in++) {
+            for (int kidx = 0; kidx < 9; kidx++) {
+                for (int ch4 = 0; ch4 < 4; ch4++) {
+                    int out_ch = g*4 + ch4; // global output channel index
+                    int8_t val = 0;
+                    if (out_ch < c_out) {
+                        val = pFilters[(m_in*9 + kidx)*c_out + out_ch];
+                    } else {
+                        val = 0; // padding for missing channels
+                    }
+                    packed_filt[(m_in*9 + kidx)*4 + ch4] = val;
+                }
+            }
+        }
+
+        // For each tile (tile rows m, tile cols n), call accelerator on the 4x4 patch starting at (m*2, n*2)
+        for (int m = 0; m < tile; m++) {
+            for (int n = 0; n < tile; n++) {
+                // input pointer: start of 4x4 patch at row = m*pool_stride, col = n*pool_stride
+                // linear offset in padded_inputs (channel interleaving / accelerator expectations assumed same as before)
+                int row_offset = m * pool_stride;
+                int col_offset = n * pool_stride;
+                int8_t *inptr = padded_inputs + (row_offset * padded_size + col_offset); // assumes inner-most dimension is width
+
+                // Call accelerator for this 4-channel group and this tile's input patch
+                SCNN4x4(packed_filt, inptr);
+                RELU((int*)tile_accel_out, conv_out * conv_out);
+                // After SCNN4x4, perform pooling via accelerator's POOL/POOL_WB_INT interface.
+                // Request max-pool of 2x2 (matches your original POOL(2) usage)
+                POOL(2);
+
+                // Retrieve pooled outputs for up to 4 channels in this group
+                int pooled_val;
+                for (int ch4 = 0; ch4 < 4; ch4++) {
+                    int global_ch = g*4 + ch4;
+                    if (global_ch >= c_out) {
+                        // nothing to write for non-existent channel
+                        // but we still need to call POOL_WB_INT only for valid indices the accelerator expects.
+                        // accelerator's POOL_WB_INT takes index 1..4 — only call when channel exists.
+                        break;
+                    }
+                    POOL_WB_INT(&pooled_val, ch4 + 1);
+                    // write pooled value into final output at [global_ch, m, n]
+                    poutputs[global_ch * oside * oside + m * oside + n] = pooled_val;
+                }
+            }
+        }
+
+        free(packed_filt);
+    }
+
+    int t2 = record();
+    printf("Accelerator cycle count: %d\n", t2 - t1);
+
+    // cleanup
+    free(tile_accel_out);
+    free(padded_inputs);
+
+    return poutputs;
+}
+
+
+//-----------------------------------------------------------------------------
+// load input_matrix
+// -----------------------------------------------------------------------------
+
+
+
+
+// -----------------------------------------------------------------------------
+// Main testbench (same structure as example)
+// -----------------------------------------------------------------------------
+
+
+
+
+int main() {
+    int inside = 8;      // input size
+    int c_in1 = 1;       // first conv input channels
+    int c_out1 = 8;      // first conv output channels
+    int stride1 = 1, padding1 = 1;
+
+    // Allocate input matrix
+    int8_t *input_matrix = (int8_t*)malloc(inside*inside*c_in1*sizeof(int8_t));
+    for(int i = 0; i < inside*inside*c_in1; i++) input_matrix[i] = i+1;
+
+    // First layer filter and bias
+    int8_t *filter1 = (int8_t*)malloc(3*3*c_in1*c_out1*sizeof(int8_t));
+    int bias1[8] = { -1,-2,-3,-4,-5,-6,-7,-8 };
+    for(int i = 0; i < 3*3*c_in1*c_out1; i++) filter1[i] = 1;
+
+    // First layer convolution
+    int *out1 = RVSCNN_conv_mp(inside, c_in1, c_out1, input_matrix, filter1, stride1, padding1, bias1);
+    
+    // Compute first layer output size after pooling
+    int conv_out1 = ((inside + 2*padding1 - 3)/stride1)+1;
+    int oside1 = ((conv_out1 - 2)/2)+1;
+    int8_t *out1_i8 = (int8_t*)malloc(oside1*oside1*c_out1*sizeof(int8_t));
+
+    for (int i = 0; i < oside1*oside1*c_out1; i++) {
+        // simple cast or clamp
+        int val = out1[i];
+        if (val > 127) val = 127;
+        if (val < -128) val = -128;
+        out1_i8[i] = (int8_t)val;
+    }
+    printf("First Conv Output (1→8):\n");
+    for(int c = 0; c < c_out1; c++) {
+        printf("Channel %d:\n", c);
+        for(int i = 0; i < oside1; i++){
+            for(int j = 0; j < oside1; j++){
+                printf("%4d ", out1[c*oside1*oside1 + i*oside1 + j]);
+            }
+            printf("\n");
+        }
+    }
+
+    // --- Second Layer (8→16) ---
+    int c_in2 = c_out1;
+    int c_out2 = 16;
+    int stride2 = 1, padding2 = 1;
+
+    // Allocate second layer filters and bias
+    int8_t *filter2 = (int8_t*)malloc(3*3*c_in2*c_out2*sizeof(int8_t));
+    int bias2[16] = { -1,-2,-3,-4,-5,-6,-7,-8,-9,-10,-11,-12,-13,-14,-15,-16 };
+    // int bias2[16];
+    // for(int i = 0; i < 16; i++) bias2[i] = i+1;  // example bias
+    for(int i = 0; i < 3*3*c_in2*c_out2; i++) filter2[i] = 1;
+
+    // Second layer convolution
+    int *out2 = RVSCNN_conv_mp(oside1, c_in2, c_out2, out1_i8, filter2, stride2, padding2, bias2);
+
+    // Compute second layer output size
+    int conv_out2 = ((oside1 + 2*padding2 - 3)/stride2)+1;
+    int oside2 = ((conv_out2 - 2)/2)+1;
+
+    printf("Second Conv Output (8→16):\n");
+    for(int c = 0; c < c_out2; c++) {
+        printf("Channel %d:\n", c);
+        for(int i = 0; i < oside2; i++){
+            for(int j = 0; j < oside2; j++){
+                printf("%4d ", out2[c*oside2*oside2 + i*oside2 + j]);
+            }
+            printf("\n");
+        }
+    }
+   int *base_conv = Base_conv(inside, c_in1, c_out1, input_matrix, filter1,stride1, padding1);
+    int *base_conv1 = Base_conv(oside1, c_in2, c_out2, out1_i8, filter2, stride2, padding2);
+
+
+      printf("Convolution Output Matrices (c_out1=%d, oside1=%d):\n", c_out1, conv_out1);
+
+    for (int oc = 0; oc < 1; oc++) {
+        printf("Channel %d:\n", oc);
+        for (int i = 0; i < conv_out1; i++) {
+            for (int j = 0; j < conv_out1; j++) {
+                int idx = oc * (conv_out1 * conv_out1) + i * conv_out1 + j;
+                printf("%6d ", base_conv[idx]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+    }
+       printf("Convolution Output Matrices (c_out1=%d, oside1=%d):\n", c_out1, conv_out1);
+
+    for (int oc = 0; oc < 1; oc++) {
+        printf("Channel %d:\n", oc);
+        for (int i = 0; i < conv_out2; i++) {
+            for (int j = 0; j < conv_out2; j++) {
+                int idx = oc * (conv_out2 * conv_out2) + i * conv_out2 + j;
+                printf("%6d ", base_conv1[idx]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+    }
+    // free memory
+    free(input_matrix);
+    free(filter1);
+    free(filter2);
+    free(out1);
+    free(out2);
+    free(out1_i8);
+    return 0;
+}
+
+
