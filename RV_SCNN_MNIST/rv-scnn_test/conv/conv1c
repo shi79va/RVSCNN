@@ -1,0 +1,102 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "../include/custom.h"
+
+// -----------------------------------------------------------------------------
+// Software reference for single conv + pool (like Base_conv_mp)
+// -----------------------------------------------------------------------------
+int* Base_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters,int stride, int padding) {
+     int ksize = 3; // 3x3 kernel
+    int conv_out = ((inside + 2 * padding - ksize) / stride) + 1;
+    int oside = ((conv_out - 2) / 2) + 1; //first 2 is for pool_size   second 2 is for pool_stride
+    //int oside = (inside - 2) / 2; // after 3x3 conv + 2x2 pool   ////original///
+    printf("oside base = %d\n",oside);
+    int *temp_buffer1 = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+                int a[4] = {0, 0, 0, 0};
+                for (int m = 0; m < c_in; m++) {    
+                    for (int my = 0; my < 2; my++) {
+                        for (int mx = 0; mx < 2; mx++) {
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 0*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 1*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 2*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 3*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 4*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 5*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 6*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 7*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 8*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 2 + mx + my*inside]);
+                        }
+                    }
+                }
+
+                int b = 0;
+                if (a[0] < a[1]) b = a[1]; else b = a[0];
+                if (b < a[2]) b = a[2];
+                if (b < a[3]) b = a[3];
+
+                temp_buffer1[x*oside*oside + j + i*oside] = b;
+            }
+        }
+    }
+
+    return temp_buffer1;
+}
+
+
+int* Base_conv(int inside, int c_in, int c_out,
+               int8_t *pInputs, int8_t *pFilters,
+               int stride, int padding)
+{
+    int ksize = 3;
+    int oside = ((inside + 2 * padding - ksize) / stride) + 1;
+
+    int *poutputss = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               // output channel
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+
+                int sum = 0;
+
+                for (int m = 0; m < c_in; m++) {
+                    for (int ky = 0; ky < 3; ky++) {
+                        for (int kx = 0; kx < 3; kx++) {
+
+                            // ----- FIXED PADDING HANDLING -----
+                            int in_y = i * stride + ky - padding;
+                            int in_x = j * stride + kx - padding;
+
+                            int8_t inval = 0;  // default padded value
+
+                            if (in_y >= 0 && in_y < inside &&
+                                in_x >= 0 && in_x < inside) {
+                                inval = pInputs[m*inside*inside +
+                                               in_y*inside + in_x];
+                            }
+
+                            // original filter indexing preserved
+                            int fidx = x + m*9*c_out + ky*3*c_out + kx*c_out;
+
+                            sum += inval * pFilters[fidx];
+                        }
+                    }
+                }
+
+                // ---- FIXED OUTPUT INDEXING (must use oside) ----
+                poutputss[x*oside*oside + i*oside + j] = sum;
+            }
+        }
+    }
+
+    return poutputss;
+}
+
+

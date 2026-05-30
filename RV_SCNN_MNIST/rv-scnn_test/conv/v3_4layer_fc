@@ -1,0 +1,486 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "../include/custom.h"
+
+// -----------------------------------------------------------------------------
+// Software reference for single conv + pool (like Base_conv_mp)
+// -----------------------------------------------------------------------------
+int* Base_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters,int stride, int padding) {
+     int ksize = 3; // 3x3 kernel
+    int conv_out = ((inside + 2 * padding - ksize) / stride) + 1;
+    int oside = ((conv_out - 2) / 2) + 1; //first 2 is for pool_size   second 2 is for pool_stride
+    //int oside = (inside - 2) / 2; // after 3x3 conv + 2x2 pool   ////original///
+    printf("oside base = %d\n",oside);
+    int *temp_buffer1 = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+                int a[4] = {0, 0, 0, 0};
+                for (int m = 0; m < c_in; m++) {    
+                    for (int my = 0; my < 2; my++) {
+                        for (int mx = 0; mx < 2; mx++) {
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 0*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 1*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 2*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 3*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 4*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 5*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + inside + 2 + mx + my*inside]);
+
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 6*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 7*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 1 + mx + my*inside]);
+                            a[mx + my*2] += (pFilters[x + m*9*c_out + 8*c_out] * pInputs[m*inside*inside + 2*j + 2*i*inside + 2*inside + 2 + mx + my*inside]);
+                        }
+                    }
+                }
+
+                int b = 0;
+                if (a[0] < a[1]) b = a[1]; else b = a[0];
+                if (b < a[2]) b = a[2];
+                if (b < a[3]) b = a[3];
+
+                temp_buffer1[x*oside*oside + j + i*oside] = b;
+            }
+        }
+    }
+
+    return temp_buffer1;
+}
+
+int* Base_conv(int inside, int c_in, int c_out,
+               int8_t *pInputs, int8_t *pFilters,
+               int stride, int padding)
+{
+    int ksize = 3;
+    int oside = ((inside + 2 * padding - ksize) / stride) + 1;
+
+    int *poutputss = (int *)calloc(oside * oside * c_out, sizeof(int));
+
+    for (int x = 0; x < c_out; x++) {               // output channel
+        for (int i = 0; i < oside; i++) {
+            for (int j = 0; j < oside; j++) {
+
+                int sum = 0;
+
+                for (int m = 0; m < c_in; m++) {
+                    for (int ky = 0; ky < 3; ky++) {
+                        for (int kx = 0; kx < 3; kx++) {
+
+                            // ----- FIXED PADDING HANDLING -----
+                            int in_y = i * stride + ky - padding;
+                            int in_x = j * stride + kx - padding;
+
+                            int8_t inval = 0;  // default padded value
+
+                            if (in_y >= 0 && in_y < inside &&
+                                in_x >= 0 && in_x < inside) {
+                                inval = pInputs[m*inside*inside +
+                                               in_y*inside + in_x];
+                            }
+
+                            // original filter indexing preserved
+                            int fidx = x + m*9*c_out + ky*3*c_out + kx*c_out;
+
+                            sum += inval * pFilters[fidx];
+                        }
+                    }
+                }
+
+                // ---- FIXED OUTPUT INDEXING (must use oside) ----
+                poutputss[x*oside*oside + i*oside + j] = sum;
+            }
+        }
+    }
+
+    return poutputss;
+}
+
+
+
+
+// -----------------------------------------------------------------------------
+// Error check function (same as example)
+// -----------------------------------------------------------------------------
+int error_check(int* test1, int* test2, int num){
+    int error = 0;
+    for(int i = 0; i < num; i++){
+        error += abs(test1[i] - test2[i]);
+    }
+    return error;
+}
+
+// -----------------------------------------------------------------------------
+// Accelerator conv + pool (RVSCNN)
+// -----------------------------------------------------------------------------
+int* RVSCNN_conv_mp(int inside, int c_in, int c_out, int8_t *pInputs, int8_t *pFilters,int stride,int padding) {
+    int ksize = 3; // 3x3 kernel
+    int conv_out = ((inside + 2 * padding - ksize) / stride) + 1;
+    int oside = ((conv_out - 2) / 2) + 1; //first 2 is for pool_size   second 2 is for pool_stride
+   
+    int *poutputs = (int *)calloc(oside * oside * c_out, sizeof(int)); // final accelerator output (pooled)
+    int wb_elems = conv_out * conv_out;
+    int *tile_accel_out = calloc(wb_elems*c_out, sizeof(int)); // temp per-tile accel WB buffer
+   // int *tile_accel_out  = (int *)malloc(conv_out * conv_out *sizeof(int));
+
+    int chn_num = c_out >> 2; 
+    int tile = 1 + (inside+(2*padding) - 4)/2;  // number of tiles
+    int a = 0;
+   
+
+    printf("tile: %d\n", tile);
+    int t1 = record();
+    //L_SCNN(c_in, inside, oside*oside, 0);
+    L_SCNN(c_in, inside, conv_out * conv_out, 0);
+    for (int i = 0; i < chn_num; i++) {
+        // set mode for each of the 4 channels
+        L_MODE(0, 1, 0, 1);
+        L_MODE(0, 2, 0, 1);
+        L_MODE(0, 3, 0, 1);
+        L_MODE(0, 4, 0, 1);
+        
+        int8_t *packed_filt = malloc(9 * 4 * c_in * sizeof(int8_t));
+        // pack once per 4 output channels
+        for (int m_in = 0; m_in < c_in; m_in++) {
+            for (int kidx = 0; kidx < 9; kidx++) {
+                for (int ch4 = 0; ch4 < 4; ch4++) {
+                    int out_ch = i*4 + ch4;
+                    packed_filt[(m_in*9 + kidx)*4 + ch4] = pFilters[(m_in*9 + kidx)*c_out + out_ch];
+                }
+            }
+        }
+
+        for (int m = 0; m < tile; m++) {
+            for (int n = 0; n < tile; n++) {
+                // Call accelerator with packed filters
+                SCNN4x4(packed_filt, pInputs + n*2 + m*2*inside);
+
+                RELU((int*)tile_accel_out, conv_out);
+               
+                int offset =(i * tile * tile * 4) + (m * tile + n) * 4;
+                // Write back 4 outputs
+                SCNN_WB_INT(tile_accel_out + offset);
+                
+                POOL_RI((int8_t*)(tile_accel_out + offset));
+                POOL(2); 
+                int a;
+
+                POOL_WB_INT(&a, 1);
+                poutputs[n + m*oside + 4*i*oside*oside] = a;
+
+                POOL_WB_INT(&a, 2);
+                poutputs[oside*oside + n + m*oside + 4*i*oside*oside] = a;
+
+                POOL_WB_INT(&a, 3);
+                poutputs[2*oside*oside + n + m*oside + 4*i*oside*oside] = a;
+
+                POOL_WB_INT(&a, 4);
+                poutputs[3*oside*oside + n + m*oside + 4*i*oside*oside] = a;
+               
+                                    
+    
+            }
+        }
+    }
+    int t2 = record();
+    printf("Accelerator cycle count: %d\n", t2 - t1);
+    free(tile_accel_out);
+    return poutputs;
+    //return temp_buffer2;
+}
+
+
+
+// -----------------------------------------------------------------------------
+// Main testbench (same structure as example)
+// -----------------------------------------------------------------------------
+
+
+int main(){
+    int inside = 28;
+    int c_out1 = 8;  
+    int c_in = 1;    
+    int stride=1, padding=1;
+    int ksize = 3; // 3x3 kernel
+    int c_in2 = c_out1;
+    int c_out2 = 16;
+    int8_t *input_matrix = (int8_t *)malloc(inside*inside*c_in*sizeof(int8_t));
+    int8_t *filter_matrix1 = (int8_t *)malloc(3*3*c_in*c_out1*sizeof(int8_t));
+    int8_t *filter_matrix2 = (int8_t *)malloc(3*3*c_in2*c_out2*sizeof(int8_t));
+    
+    int ip[784] = {  1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2,
+                     1,2,0,1, 0,1,3,2, 1,0,2,1, 2,1,0,1, 1,2,0,1, 0,1,3,2
+                     };
+    
+    int idx1 = 0;
+    for (int i = 0; i < 784; i++) {         
+        for (int x = 0; x < c_in; x++) {  
+            input_matrix[idx1++] = ip[i];
+        }
+    }
+//////////////////////////////////////////////////////filter1/////////////  
+    //int k[9] = { 1, 3, -2,  1, 0, -1,  1, 0, -1 };
+    int k1[9] = { 1, 0, 1,  0, 1, 0,  1, 0, 1 };
+    //int k[9] = { -1, -1, -1,  -1, -1, -1,  -1, -1, -1 };
+    int idx = 0;
+    for (int i = 0; i < 9; i++) {         
+        for (int x = 0; x < c_out1; x++) {  
+            filter_matrix1[idx++] = k1[i];
+        }
+    }
+//////////////////////////////////////////////////////filter2///////////////
+    
+    int k2[9] = {1, 3, -2,  1, 0, -1,  1, 0, -1};
+    for (int oc = 0; oc < c_out2; oc++) {
+        for (int ic = 0; ic < c_in2; ic++) {
+            for (int k = 0; k < 9; k++) {
+                filter_matrix2[oc + ic*c_out2 + k*c_out2*c_in2] = k2[k];
+                // or simpler: filter_matrix2[idx2++] = k2[k];
+            }
+        }
+    }
+    
+
+    // // Accelerator run
+// Layer 1: Conv1 + MaxPool1
+    int *out1 =RVSCNN_conv_mp(inside, c_in, c_out1, input_matrix, filter_matrix1, stride, padding);
+    int conv_out1 = ((inside + 2 * padding - ksize) / stride) + 1;
+    int oside1 = (conv_out1 - 2)/2 + 1; // pooled output size 3
+
+// === QUANTIZE LAYER 1 OUTPUT TO INT8 ===
+    int8_t *out1_int8 = (int8_t *)malloc(oside1 * oside1 * c_out1 * sizeof(int8_t));
+
+    // Simple symmetric quantization (adjust scale if needed)
+    float scale = 1.0f;  // Tune this! Or use max(abs)/127
+    for (int i = 0; i < oside1*oside1*c_out1; i++) {
+        int val = out1[i];
+        int q = (int)(val * scale);
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        out1_int8[i] = (int8_t)q;
+    }
+    
+// Layer 2: Conv2 + MaxPool2
+    int *out2 = RVSCNN_conv_mp(oside1, c_in2, c_out2, out1_int8, filter_matrix2, stride, padding);
+    int conv_out2 = ((oside1 + 2 * padding - ksize) / stride) + 1;
+    int oside2 = (conv_out2 - 2)/2 + 1; // pooled output size 3
+
+///////////////////////////flatten layer.//////////////////
+    int flattened_size = 7 * 7 * 16;  // = 784
+    int8_t *flattened = (int8_t *)malloc(flattened_size * sizeof(int8_t));
+
+    // Copy + quantize the final accelerator output
+    for (int i = 0; i < flattened_size; i++) {
+        int val = out2[i];                    // out2 is int* from RVSCNN_conv_mp
+        val = (val > 127) ? 127 : (val < -128 ? -128 : val);
+        flattened[i] = (int8_t)val;
+    }
+
+    printf("\n=== FLATTENED VECTOR — CHANNEL-WISE VIEW ===\n");
+    for (int c = 0; c < 16; c++) {
+        printf("Channel %2d (spatial 7x7):\n", c);
+        for (int y = 0; y < 7; y++) {
+            for (int x = 0; x < 7; x++) {
+                int idx = y * 7 * 16 + x * 16 + c;  // column-major flatten (matches your conv output)
+                printf("%4d ", flattened[idx]);
+            }
+            printf("\n");
+        }
+        printf("\n");
+    }
+
+   printf("\n=== ADDING FULLY CONNECTED LAYERS (SOFTWARE GEMM) ===\n");
+
+// ----------------------------- FC1: 784 → 128 -----------------------------
+    int fc1_out = 128;
+    int fc2_out = 10;
+
+    int32_t fc1_result[128] = {0};
+    int32_t fc2_result[10] = {0};
+
+    // Simple random weights (replace with trained ones)
+    int8_t fc1_weights[784 * 128];
+    int8_t fc2_weights[128 * 10];
+    int32_t fc1_bias[128] = {0};
+    int32_t fc2_bias[10] = {0};
+
+    // Initialize (small random for stability)
+    srand(42);  // reproducible
+    for (int i = 0; i < 784 * 128; i++) fc1_weights[i] = (int8_t)((rand() % 23) - 11);
+    for (int i = 0; i < 128 * 10;  i++) fc2_weights[i] = (int8_t)((rand() % 27) - 13);
+
+    int t_start = record();
+
+    // FC1: Simple matrix multiply (flattened 784 x 128)
+    for (int oc = 0; oc < fc1_out; oc++) {
+        for (int ic = 0; ic < 784; ic++) {
+            fc1_result[oc] += (int32_t)flattened[ic] * (int32_t)fc1_weights[oc * 784 + ic];
+        }
+        fc1_result[oc] += fc1_bias[oc];
+        if (fc1_result[oc] < 0) fc1_result[oc] = 0;  // ReLU
+    }
+
+    printf("FC1 (784→128) done in %d cycles\n", record() - t_start);
+
+    // Quantize FC1 for FC2 (optional, but good practice)
+    int8_t fc1_quant[128];
+    float fc1_scale = 127.0f / 1000.0f;  // rough scale, tune later
+    for (int i = 0; i < 128; i++) {
+        int q = (int)((float)fc1_result[i] * fc1_scale);
+        fc1_quant[i] = (q > 127) ? 127 : (q < -128 ? -128 : (int8_t)q);
+    }
+
+    // ----------------------------- FC2: 128 → 10 -----------------------------
+    t_start = record();
+
+    for (int oc = 0; oc < fc2_out; oc++) {
+        for (int ic = 0; ic < 128; ic++) {
+            fc2_result[oc] += (int32_t)fc1_quant[ic] * (int32_t)fc2_weights[oc * 128 + ic];
+        }
+        fc2_result[oc] += fc2_bias[oc];
+    }
+
+    printf("FC2 (128→10) done in %d cycles\n", record() - t_start);
+
+    // ----------------------------- SOFTMAX & PREDICTION -----------------------------
+    // ----------------------------- INTEGER-ONLY SOFTMAX & PREDICTION -----------------------------
+    printf("\n=== FINAL CLASSIFIER OUTPUT (Logits) ===\n");
+    for (int i = 0; i < 10; i++) {
+        printf("Class %d: %6d\n", i, fc2_result[i]);
+    }
+
+    // Find max logit (for numeric stability)
+    int32_t max_logit = fc2_result[0];
+    for (int i = 1; i < 10; i++) {
+        if (fc2_result[i] > max_logit) max_logit = fc2_result[i];
+    }
+
+    // Integer approximation of exp(x) using lookup table (range -8 to +8 is enough)
+    int32_t exp_table[17] = {
+        1,      3,      8,     22,     61,    167,    455,   1237,
+        3365,  9150, 24867, 67600, 183790, 500000, 1359999, 3700000, 10000000
+    };
+
+    // Compute unnormalized "exp" (shifted to avoid overflow)
+    int64_t unnorm[10] = {0};
+    int64_t sum_exp = 0;
+
+    for (int i = 0; i < 10; i++) {
+        int32_t diff = fc2_result[i] - max_logit;           // diff ∈ [-big, 0]
+        int idx = diff < -8 ? 0 : (diff > 8 ? 16 : diff + 8); // clamp to table range
+        unnorm[i] = exp_table[idx];
+        sum_exp += unnorm[i];
+    }
+
+    // Convert to percentages (fixed point)
+    int predicted = 0;
+    int max_percent = 0;
+
+    printf("\n=== PROBABILITY DISTRIBUTION (integer approx) ===\n");
+    for (int i = 0; i < 10; i++) {
+        int percent = (int)((unnorm[i] * 1000LL) / sum_exp);  // 0.1% precision
+        printf("Class %d: %4d.%d%%\n", i, percent / 10, percent % 10);
+        if (percent > max_percent) {
+            max_percent = percent;
+            predicted = i;
+        }
+    }
+
+    printf("\nPREDICTED CLASS: %d  (confidence: %d.%d%%)\n", 
+        predicted, max_percent / 10, max_percent % 10);
+
+    printf("\nYOUR CUSTOM SYSTOLIC ARRAY JUST RAN A FULL INTEGER-ONLY CNN CLASSIFIER!\n");
+    // Software reference
+    int *base_out = Base_conv_mp(inside, c_in, c_out1, input_matrix, filter_matrix1,stride, padding);
+     int *base_conv1 = Base_conv(inside, c_in, c_out1, input_matrix, filter_matrix1,stride, padding);
+    // int *base_conv2 = Base_conv(oside1, c_in2, c_out2, base_conv1, filter_matrix2,stride, padding);
+    // // Error check
+    // int error = error_check(out1, base_out, num_elem);
+    // printf("inside:%d c_in:%d c_out:%d\n", inside, c_in, c_out);
+    // printf("error:%d\n", error);
+
+    
+    printf("Accelerator Output:\n");
+    for (int c = 0; c < c_out1; c++) {
+        printf("Channel %d:\n", c);
+        for (int i = 0; i < oside1; i++) {
+            for (int j = 0; j < oside1; j++) {
+                printf("%4d ", out1[c*oside1*oside1 + i*oside1 + j]);
+            }
+            printf("\n");
+        }
+    }
+    printf("Accelerator Output:\n");
+    for (int c = 0; c < c_out2; c++) {
+        printf("Channel %d:\n", c);
+        for (int i = 0; i < oside2; i++) {
+            for (int j = 0; j < oside2; j++) {
+                printf("%4d ", out2[c*oside2*oside2 + i*oside2 + j]);
+            }
+            printf("\n");
+        }
+    }
+    //  printf("base Output:\n");
+    // for (int c = 0; c < c_out; c++) {
+    //     printf("Channel %d:\n", c);
+    //     for (int i = 0; i < oside; i++) {
+    //         for (int j = 0; j < oside; j++) {
+    //             printf("%4d ", base_out[c*oside*oside + i*oside + j]);
+    //         }
+    //         printf("\n");
+    //     }
+    // }
+    
+    printf("Convolution Output Matrices (c_out1=%d, oside1=%d):\n", c_out1, conv_out1);
+   for (int c = 0; c <1; c++) {
+     printf("Channel %d:\n", c);
+    for (int i = 0; i < conv_out1; i++) {
+        for (int j = 0; j < conv_out1; j++) {
+            printf("%4d ", base_conv1[c * conv_out1 * conv_out1 + i * conv_out1 + j]);
+        }
+        printf("\n");
+    }
+}
+//   printf("Convolution Output Matrices (c_out2=%d, oside=%d):\n", c_out2, conv_out2);
+//    for (int c = 0; c < c_out2; c++) {
+//      printf("Channel %d:\n", c);
+//     for (int i = 0; i < conv_out2; i++) {
+//         for (int j = 0; j < conv_out2; j++) {
+//             printf("%4d ", base_conv2[c * conv_out2 * conv_out2 + i * conv_out2 + j]);
+//         }
+//         printf("\n");
+//     }
+// }
+    free(input_matrix);
+    free(filter_matrix1);
+     free(filter_matrix1);
+    free(filter_matrix2);
+    free(out1);
+    free(out2);
+    free(base_conv1);
+   // free(base_conv2);
+    
+    return 0;
+}
+
+
+
+
