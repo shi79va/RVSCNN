@@ -1,0 +1,11 @@
+To run MNIST :
+#####How To Run??
+cd core-v-verif/
+cd cv32e40p/
+cd sim/
+cd core/
+make veri-test TEST=conv
+cd rv-scnn_test/
+cd conv
+riscv32-unknown-elf-gcc -S -O3 conv.c
+cp conv.s ../../core-v-verif/cv32e40p/tests/programs/custom/conv/conv.S
